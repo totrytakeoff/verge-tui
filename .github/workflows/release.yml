@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: verge-tui-linux-x86_64
+            bin_name: verge-tui
+          - os: macos-latest
+            asset_name: verge-tui-macos-x86_64
+            bin_name: verge-tui
+          - os: windows-latest
+            asset_name: verge-tui-windows-x86_64.exe
+            bin_name: verge-tui.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build release
+        run: cargo build -p verge-tui --release --locked
+
+      - name: Prepare asset (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/release/${{ matrix.bin_name }} ${{ matrix.asset_name }}
+
+      - name: Prepare asset (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "target/release/${{ matrix.bin_name }}" "${{ matrix.asset_name }}"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}

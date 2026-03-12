@@ -1,0 +1,16 @@
+[package]
+name = "verge-tui"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+ratatui = "0.29.0"
+crossterm = "0.29.0"
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+mihomo-client = { workspace = true }
+verge-core = { workspace = true }
+clash_verge_service_ipc = { version = "2.1.3", features = ["client"], git = "https://github.com/clash-verge-rev/clash-verge-service-ipc" }

@@ -1,0 +1,42 @@
+[workspace]
+members = [
+  "apps/verge-tui",
+  "crates/mihomo-client",
+  "crates/verge-core",
+]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+debug = false
+strip = true
+overflow-checks = false
+rpath = false
+
+[profile.dev]
+incremental = true
+codegen-units = 64
+opt-level = 0
+debug = true
+strip = "none"
+overflow-checks = true
+lto = false
+rpath = false
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+tokio = { version = "1.50.0", features = [
+  "rt-multi-thread",
+  "macros",
+  "time",
+  "sync",
+] }
+serde = { version = "1.0.228" }
+serde_json = "1.0.149"
+serde_yaml_ng = "0.10.0"
+
+mihomo-client = { path = "crates/mihomo-client" }
+verge-core = { path = "crates/verge-core" }
