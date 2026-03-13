@@ -2,12 +2,12 @@ use std::{
     collections::HashMap,
     collections::HashSet,
     collections::VecDeque,
+    fs,
     fs::OpenOptions,
     io,
-    fs,
     io::Write as _,
-    process::Stdio,
     path::{Path, PathBuf},
+    process::Stdio,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,7 +28,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
 };
 use tokio::{process::Child, sync::mpsc, time::sleep};
-use verge_core::{ImportOptions, StateStore, apply_system_proxy};
+use verge_core::{BackendExitPolicy, ImportOptions, StateStore, apply_system_proxy};
 
 const LOG_LIMIT: usize = 200;
 const TRAFFIC_HISTORY_LIMIT: usize = 120;
@@ -108,11 +108,20 @@ enum BulkDelayEvent {
     Finished,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitConfirmChoice {
+    KeepBackend,
+    StopBackend,
+}
+
 struct App {
     tab_index: usize,
     command_mode: bool,
     command_input: String,
     show_help_overlay: bool,
+    show_exit_confirm_overlay: bool,
+    exit_confirm_choice: ExitConfirmChoice,
+    exit_keep_backend_override: Option<bool>,
     should_quit: bool,
     bootstrap_pending: bool,
     app_started_at: Instant,
@@ -147,6 +156,8 @@ struct App {
     managed_core_socket: Option<String>,
     health_probe_failures: u8,
     direct_mode_logged: bool,
+    auto_update_next_at: Option<Instant>,
+    auto_update_running: bool,
     file_log_path: Option<PathBuf>,
     session_log_path: Option<PathBuf>,
     file_log: Option<std::fs::File>,
@@ -173,6 +184,9 @@ impl App {
             command_mode: false,
             command_input: String::new(),
             show_help_overlay: false,
+            show_exit_confirm_overlay: false,
+            exit_confirm_choice: ExitConfirmChoice::KeepBackend,
+            exit_keep_backend_override: None,
             should_quit: false,
             bootstrap_pending: true,
             app_started_at: Instant::now(),
@@ -207,6 +221,8 @@ impl App {
             managed_core_socket: None,
             health_probe_failures: 0,
             direct_mode_logged: false,
+            auto_update_next_at: None,
+            auto_update_running: false,
             file_log_path: None,
             session_log_path: None,
             file_log: None,
@@ -216,6 +232,7 @@ impl App {
 
         app.init_file_logging();
         app.log_boot_diagnostics();
+        app.schedule_next_auto_update("startup");
         app.push_log("verge-tui started. Type ':' then 'help' to view commands.");
         if let Err(err) = apply_system_proxy(&app.store.state.verge) {
             app.push_log(format!("apply system proxy on boot failed: {err}"));
@@ -283,6 +300,13 @@ impl App {
             prefers_independent_core(),
             prefers_service_ipc()
         ));
+        self.push_log(format!(
+            "startup policy: autosub={}min cleanup-on-exit={} backend-exit-policy={} (legacy keep-core-on-exit={})",
+            self.store.state.verge.auto_update_subscription_minutes,
+            self.store.state.verge.auto_cleanup_on_exit,
+            backend_exit_policy_label(self.store.state.verge.backend_exit_policy),
+            self.store.state.verge.keep_core_on_exit
+        ));
         if let Some(path) = self.file_log_path.as_ref() {
             self.push_log(format!("file log: {}", path.display()));
         }
@@ -322,10 +346,7 @@ impl App {
         let name = profile.name.clone();
         let path = self.store.paths.profiles_dir.join(&file);
         if !path.exists() {
-            self.push_log(format!(
-                "skip apply current profile: missing file {}",
-                path.display()
-            ));
+            self.push_log(format!("skip apply current profile: missing file {}", path.display()));
             return;
         }
         match self.apply_profile_file_to_core(&file).await {
@@ -344,8 +365,7 @@ impl App {
             Ok(()) => Ok(()),
             Err(err) => {
                 let msg = err.to_string();
-                if msg.contains("SAFE_PATHS") || msg.contains("path is not subpath of home directory")
-                {
+                if msg.contains("SAFE_PATHS") || msg.contains("path is not subpath of home directory") {
                     let copied = self.copy_profile_to_safe_path(file, &path)?;
                     let copied_str = copied.to_string_lossy().to_string();
                     return self
@@ -398,18 +418,12 @@ impl App {
     }
 
     fn copy_profile_to_safe_path(&self, file: &str, src: &Path) -> Result<PathBuf> {
-        let mut candidates = vec![self
-            .store
-            .paths
-            .root
-            .join("core-home")
-            .join("verge-tui-profiles")];
+        let mut candidates = vec![self.store.paths.root.join("core-home").join("verge-tui-profiles")];
         if let Some(hint) = detect_clash_verge_api_hint() {
             candidates.push(hint.app_home.join("verge-tui-profiles"));
         }
 
-        let data = std::fs::read(src)
-            .with_context(|| format!("read profile source failed: {}", src.display()))?;
+        let data = std::fs::read(src).with_context(|| format!("read profile source failed: {}", src.display()))?;
         let mut last_err = String::new();
         for dir in candidates {
             match std::fs::create_dir_all(&dir) {
@@ -538,10 +552,7 @@ impl App {
             return;
         };
 
-        self.push_log(format!(
-            "detected clash-verge config: {}",
-            hint.source_config.display()
-        ));
+        self.push_log(format!("detected clash-verge config: {}", hint.source_config.display()));
 
         if hint.enable_external_controller == Some(false) || hint.controller_url.is_none() {
             for socket_path in local_socket_candidates(&hint) {
@@ -553,16 +564,11 @@ impl App {
                     Ok(client) => match client.get_version().await {
                         Ok(v) => {
                             self.mihomo = client;
-                            self.push_log(format!(
-                                "adopted local socket => {socket_path} (mihomo {})",
-                                v.version
-                            ));
+                            self.push_log(format!("adopted local socket => {socket_path} (mihomo {})", v.version));
                             return;
                         }
                         Err(err) => {
-                            self.push_log(format!(
-                                "socket candidate unreachable: {socket_path} ({err})"
-                            ));
+                            self.push_log(format!("socket candidate unreachable: {socket_path} ({err})"));
                         }
                     },
                     Err(err) => {
@@ -574,9 +580,7 @@ impl App {
 
         let Some(controller_url) = hint.controller_url.clone() else {
             if hint.enable_external_controller == Some(false) {
-                self.push_log(
-                    "clash-verge external-controller is disabled, and no local socket path was reachable",
-                );
+                self.push_log("clash-verge external-controller is disabled, and no local socket path was reachable");
             } else {
                 self.push_log("clash-verge external-controller is empty; cannot connect by HTTP API");
             }
@@ -635,12 +639,14 @@ impl App {
             Ok(Some(status)) => {
                 self.managed_core_child = None;
                 self.managed_core_socket = None;
+                self.remove_managed_core_pid_file();
                 self.push_log(format!("managed mihomo exited: {status}"));
             }
             Ok(None) => {}
             Err(err) => {
                 self.managed_core_child = None;
                 self.managed_core_socket = None;
+                self.remove_managed_core_pid_file();
                 self.push_log(format!("managed mihomo wait failed: {err}"));
             }
         }
@@ -651,14 +657,18 @@ impl App {
         if self.managed_core_child.is_some() {
             return Ok(());
         }
+        if let Some(pid) = self.read_managed_core_pid()
+            && !is_pid_alive(pid)
+        {
+            self.remove_managed_core_pid_file();
+            self.push_log(format!("removed stale managed core pid file (pid={pid})"));
+        }
 
         let use_service_ipc = prefers_service_ipc();
         if use_service_ipc {
             let _ = self.try_bootstrap_service_ipc().await;
         } else if !self.direct_mode_logged {
-            self.push_log(
-                "direct-core mode: skip service IPC (set VERGE_TUI_USE_SERVICE_IPC=1 to enable)",
-            );
+            self.push_log("direct-core mode: skip service IPC (set VERGE_TUI_USE_SERVICE_IPC=1 to enable)");
             self.direct_mode_logged = true;
         }
 
@@ -683,8 +693,7 @@ impl App {
             return Ok(());
         };
 
-        let (config_home, cfg) =
-            self.prepare_runtime_config_for_managed_core(hint.as_ref(), &socket, independent)?;
+        let (config_home, cfg) = self.prepare_runtime_config_for_managed_core(hint.as_ref(), &socket, independent)?;
 
         if use_service_ipc {
             if self
@@ -808,12 +817,8 @@ impl App {
             .with_context(|| format!("create core-home failed: {}", config_home.display()))?;
         let cfg = config_home.join("verge-tui-runtime.yaml");
         let yaml = serde_yaml_ng::to_string(&map).context("serialize runtime yaml failed")?;
-        std::fs::write(&cfg, yaml)
-            .with_context(|| format!("write runtime yaml failed: {}", cfg.display()))?;
-        self.push_log(format!(
-            "using independent runtime config: {}",
-            cfg.display()
-        ));
+        std::fs::write(&cfg, yaml).with_context(|| format!("write runtime yaml failed: {}", cfg.display()))?;
+        self.push_log(format!("using independent runtime config: {}", cfg.display()));
         Ok((config_home, cfg))
     }
 
@@ -835,9 +840,7 @@ impl App {
             if sudo_ok {
                 self.push_log("requested start for clash-verge-service.service");
             } else {
-                self.push_log(
-                    "service needs privilege. run once: sudo systemctl start clash-verge-service.service",
-                );
+                self.push_log("service needs privilege. run once: sudo systemctl start clash-verge-service.service");
             }
         }
 
@@ -862,8 +865,7 @@ impl App {
         let mut last_err: Option<String> = None;
         for _ in 0..SERVICE_WAIT_RETRIES {
             self.ensure_service_ipc_compat_path();
-            if clash_verge_service_ipc::is_ipc_path_exists()
-            {
+            if clash_verge_service_ipc::is_ipc_path_exists() {
                 match clash_verge_service_ipc::connect().await {
                     Ok(_) => {
                         self.push_log("clash-verge-service IPC is ready");
@@ -912,10 +914,7 @@ impl App {
 
             if let Some(parent) = primary.parent() {
                 if let Err(err) = fs::create_dir_all(parent) {
-                    self.push_log(format!(
-                        "service IPC compat mkdir failed: {} ({err})",
-                        parent.display()
-                    ));
+                    self.push_log(format!("service IPC compat mkdir failed: {} ({err})", parent.display()));
                     return;
                 }
             }
@@ -989,6 +988,7 @@ impl App {
             {
                 self.mihomo = client;
                 self.managed_core_socket = Some(socket.to_string());
+                self.remove_managed_core_pid_file();
                 self.push_log(format!("managed mihomo ready by service on socket: {socket}"));
                 return Ok(true);
             }
@@ -999,6 +999,7 @@ impl App {
             && client.get_version().await.is_ok()
         {
             self.mihomo = client;
+            self.remove_managed_core_pid_file();
             self.push_log(format!(
                 "managed mihomo ready by service on HTTP controller: {http_controller}"
             ));
@@ -1051,6 +1052,10 @@ impl App {
         })?;
         self.managed_core_child = Some(child);
         self.managed_core_socket = Some(socket.to_string());
+        if let Some(pid) = self.managed_core_child.as_ref().and_then(|child| child.id()) {
+            self.write_managed_core_pid_file(pid, socket, cfg);
+            self.push_log(format!("managed core pid: {pid}"));
+        }
         self.push_log(format!(
             "spawned managed mihomo: {} (config: {})",
             core_bin.display(),
@@ -1078,9 +1083,7 @@ impl App {
             && client.get_version().await.is_ok()
         {
             self.mihomo = client;
-            self.push_log(format!(
-                "managed mihomo ready on HTTP controller: {http_controller}"
-            ));
+            self.push_log(format!("managed mihomo ready on HTTP controller: {http_controller}"));
             return Ok(());
         }
 
@@ -1095,11 +1098,23 @@ impl App {
     }
 
     async fn shutdown(&mut self) {
-        if let Some(mut child) = self.managed_core_child.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        let keep_backend = self.effective_keep_core_on_exit();
+        if keep_backend {
+            self.push_log("exit: keeping backend running");
+        } else {
+            self.cleanup_before_exit().await;
+            self.push_log("exit: stopping backend");
+            self.stop_managed_core_backend().await;
         }
-        self.managed_core_socket = None;
+
+        if keep_backend {
+            if let Some(child) = self.managed_core_child.take() {
+                let pid = child.id().unwrap_or(0);
+                self.push_log(format!("leaving managed core running in background (pid={pid})"));
+                drop(child);
+            }
+            self.managed_core_socket = None;
+        }
     }
 
     async fn init_streams(&mut self) {
@@ -1141,6 +1156,208 @@ impl App {
         }
     }
 
+    fn effective_keep_core_on_exit(&self) -> bool {
+        if let Some(keep) = self.exit_keep_backend_override {
+            return keep;
+        }
+
+        match self.store.state.verge.backend_exit_policy {
+            BackendExitPolicy::AlwaysOn => true,
+            BackendExitPolicy::AlwaysOff => false,
+            BackendExitPolicy::Query => self.store.state.verge.keep_core_on_exit,
+        }
+    }
+
+    fn request_quit(&mut self) {
+        self.exit_keep_backend_override = None;
+        self.show_exit_confirm_overlay = false;
+        match self.store.state.verge.backend_exit_policy {
+            BackendExitPolicy::AlwaysOn => {
+                self.exit_keep_backend_override = Some(true);
+                self.should_quit = true;
+            }
+            BackendExitPolicy::AlwaysOff => {
+                self.exit_keep_backend_override = Some(false);
+                self.should_quit = true;
+            }
+            BackendExitPolicy::Query => {
+                self.show_exit_confirm_overlay = true;
+                self.exit_confirm_choice = if self.store.state.verge.keep_core_on_exit {
+                    ExitConfirmChoice::KeepBackend
+                } else {
+                    ExitConfirmChoice::StopBackend
+                };
+            }
+        }
+    }
+
+    async fn confirm_quit_by_choice(&mut self) {
+        let keep = matches!(self.exit_confirm_choice, ExitConfirmChoice::KeepBackend);
+        self.exit_keep_backend_override = Some(keep);
+        self.store.state.verge.keep_core_on_exit = keep;
+        if let Err(err) = self.store.save().await {
+            self.push_log(format!("save exit choice failed: {err}"));
+        }
+        self.show_exit_confirm_overlay = false;
+        self.should_quit = true;
+    }
+
+    fn managed_core_pid_file_path(&self) -> PathBuf {
+        self.store.paths.root.join("core-home").join("managed-core.pid")
+    }
+
+    fn write_managed_core_pid_file(&mut self, pid: u32, socket: &str, cfg: &Path) {
+        let pid_file = self.managed_core_pid_file_path();
+        if let Some(parent) = pid_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let content = format!(
+            "pid={pid}\nsocket={socket}\nconfig={}\nupdated={}\n",
+            cfg.display(),
+            epoch_hms()
+        );
+        if let Err(err) = fs::write(&pid_file, content) {
+            self.push_log(format!(
+                "write managed core pid file failed: {} ({err})",
+                pid_file.display()
+            ));
+        }
+    }
+
+    fn remove_managed_core_pid_file(&mut self) {
+        let pid_file = self.managed_core_pid_file_path();
+        let _ = fs::remove_file(pid_file);
+    }
+
+    fn read_managed_core_pid(&self) -> Option<u32> {
+        let pid_file = self.managed_core_pid_file_path();
+        let content = fs::read_to_string(pid_file).ok()?;
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("pid=")
+                && let Ok(pid) = value.parse::<u32>()
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    async fn stop_managed_core_backend(&mut self) {
+        if let Some(mut child) = self.managed_core_child.take() {
+            let pid = child.id().unwrap_or(0);
+            self.push_log(format!("stopping managed core child (pid={pid})"));
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            self.remove_managed_core_pid_file();
+            self.managed_core_socket = None;
+            return;
+        }
+
+        if let Some(pid) = self.read_managed_core_pid() {
+            if terminate_pid(pid) {
+                self.push_log(format!("sent terminate signal to managed core pid={pid}"));
+                self.remove_managed_core_pid_file();
+                self.managed_core_socket = None;
+            } else {
+                self.push_log(format!("failed to terminate pid={pid} (or already exited)"));
+            }
+            return;
+        }
+
+        self.push_log("managed core stop: no child handle and no pid file");
+    }
+
+    fn schedule_next_auto_update(&mut self, reason: &str) {
+        let minutes = self.store.state.verge.auto_update_subscription_minutes;
+        if minutes == 0 {
+            self.auto_update_next_at = None;
+            self.push_log(format!("auto subscription update disabled ({reason})"));
+            return;
+        }
+
+        let delay = Duration::from_secs(minutes.saturating_mul(60));
+        self.auto_update_next_at = Some(Instant::now() + delay);
+        self.push_log(format!(
+            "auto subscription update scheduled every {minutes} min ({reason})"
+        ));
+    }
+
+    fn auto_update_status_line(&self) -> String {
+        let minutes = self.store.state.verge.auto_update_subscription_minutes;
+        if minutes == 0 {
+            return "autosub: disabled".to_string();
+        }
+        let remain = self
+            .auto_update_next_at
+            .map(|at| at.saturating_duration_since(Instant::now()).as_secs())
+            .unwrap_or(0);
+        format!("autosub: every {minutes} min, next in {remain}s")
+    }
+
+    async fn maybe_run_auto_update(&mut self) {
+        let Some(next) = self.auto_update_next_at else {
+            return;
+        };
+        if self.auto_update_running || Instant::now() < next {
+            return;
+        }
+        if self.store.state.profiles.is_empty() {
+            self.push_log("auto subscription update skipped: no profiles");
+            self.schedule_next_auto_update("no-profiles");
+            return;
+        }
+
+        self.auto_update_running = true;
+        self.push_log("auto subscription update started");
+        self.refresh_all_profile_subscriptions().await;
+        self.auto_update_running = false;
+        self.schedule_next_auto_update("completed");
+    }
+
+    async fn cleanup_before_exit(&mut self) {
+        if !self.store.state.verge.auto_cleanup_on_exit {
+            self.push_log("exit cleanup disabled by config (set cleanup-on-exit on to enable)");
+            return;
+        }
+
+        let mut state_changed = false;
+
+        if self.store.state.verge.enable_tun_mode {
+            match self.apply_tun_mode(false).await {
+                Ok(_) => {
+                    self.store.state.verge.enable_tun_mode = false;
+                    state_changed = true;
+                    self.push_log("exit cleanup: tun disabled");
+                }
+                Err(err) => {
+                    self.push_log(format!("exit cleanup: disable tun failed: {err}"));
+                    #[cfg(target_os = "linux")]
+                    self.push_log("hint: run scripts/proxy-clean-linux.sh --yes if routes/rules remain");
+                }
+            }
+        }
+
+        let mut clear_proxy_cfg = self.store.state.verge.clone();
+        clear_proxy_cfg.enable_system_proxy = false;
+        match apply_system_proxy(&clear_proxy_cfg) {
+            Ok(_) => {
+                if self.store.state.verge.enable_system_proxy {
+                    self.store.state.verge.enable_system_proxy = false;
+                    state_changed = true;
+                }
+                self.push_log("exit cleanup: system proxy disabled");
+            }
+            Err(err) => {
+                self.push_log(format!("exit cleanup: clear system proxy failed: {err}"));
+            }
+        }
+
+        if state_changed && let Err(err) = self.store.save().await {
+            self.push_log(format!("exit cleanup: save state failed: {err}"));
+        }
+    }
+
     async fn on_tick(&mut self) {
         self.tick_count = self.tick_count.saturating_add(1);
         self.reap_managed_core();
@@ -1161,6 +1378,7 @@ impl App {
             }
         }
 
+        self.maybe_run_auto_update().await;
         if let Some(rx) = &mut self.traffic_rx {
             while let Ok(traffic) = rx.try_recv() {
                 self.traffic = traffic;
@@ -1178,11 +1396,7 @@ impl App {
         if let Some(rx) = &mut self.bulk_delay_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    BulkDelayEvent::Started {
-                        total,
-                        url,
-                        timeout_ms,
-                    } => {
+                    BulkDelayEvent::Started { total, url, timeout_ms } => {
                         self.bulk_delay_running = true;
                         self.bulk_delay_total = total;
                         self.bulk_delay_done = 0;
@@ -1206,9 +1420,7 @@ impl App {
                             }
                         }
 
-                        if self.bulk_delay_done == self.bulk_delay_total
-                            || self.bulk_delay_done % 20 == 0
-                        {
+                        if self.bulk_delay_done == self.bulk_delay_total || self.bulk_delay_done % 20 == 0 {
                             bulk_logs.push(format!(
                                 "bulk delay progress: {}/{} (ok {}, fail {})",
                                 self.bulk_delay_done,
@@ -1369,14 +1581,7 @@ impl App {
     }
 
     async fn refresh_profile_subscription_by_uid(&mut self, uid: &str) -> bool {
-        let Some(profile) = self
-            .store
-            .state
-            .profiles
-            .iter()
-            .find(|p| p.uid == uid)
-            .cloned()
-        else {
+        let Some(profile) = self.store.state.profiles.iter().find(|p| p.uid == uid).cloned() else {
             self.push_log(format!("profile not found: {uid}"));
             return false;
         };
@@ -1416,17 +1621,11 @@ impl App {
         for (mode, options) in attempts {
             match self.store.update_profile(uid, &options).await {
                 Ok(profile) => {
-                    self.push_log(format!(
-                        "subscription updated: {} ({uid}) via {mode}",
-                        profile.name
-                    ));
+                    self.push_log(format!("subscription updated: {} ({uid}) via {mode}", profile.name));
                     updated = Some(profile);
                     break;
                 }
-                Err(err) => self.push_log(format!(
-                    "update {} ({uid}) via {mode} failed: {err}",
-                    profile.name
-                )),
+                Err(err) => self.push_log(format!("update {} ({uid}) via {mode} failed: {err}", profile.name)),
             }
         }
 
@@ -1439,15 +1638,10 @@ impl App {
             if self.ensure_mihomo_ready(false).await {
                 match self.apply_profile_file_to_core(&updated.file).await {
                     Ok(_) => {
-                        self.push_log(format!(
-                            "applied updated profile to mihomo: {}",
-                            updated.name
-                        ));
+                        self.push_log(format!("applied updated profile to mihomo: {}", updated.name));
                         self.refresh_proxies().await;
                     }
-                    Err(err) => self.push_log(format!(
-                        "apply updated profile to mihomo failed: {err}"
-                    )),
+                    Err(err) => self.push_log(format!("apply updated profile to mihomo failed: {err}")),
                 }
             } else {
                 self.push_log("mihomo unavailable, updated profile saved locally only");
@@ -1487,9 +1681,7 @@ impl App {
                 failed += 1;
             }
         }
-        self.push_log(format!(
-            "subscription refresh completed: ok {ok}, failed {failed}"
-        ));
+        self.push_log(format!("subscription refresh completed: ok {ok}, failed {failed}"));
     }
 
     fn selected_profile(&self) -> Option<&verge_core::ProfileItem> {
@@ -1621,11 +1813,7 @@ impl App {
 
     fn push_traffic_samples(&mut self) {
         push_capped(&mut self.traffic_up_history, self.traffic.up, TRAFFIC_HISTORY_LIMIT);
-        push_capped(
-            &mut self.traffic_down_history,
-            self.traffic.down,
-            TRAFFIC_HISTORY_LIMIT,
-        );
+        push_capped(&mut self.traffic_down_history, self.traffic.down, TRAFFIC_HISTORY_LIMIT);
     }
 
     fn uptime_hms(&self) -> String {
@@ -1669,10 +1857,7 @@ impl App {
             .context("apply tun config through mihomo api failed")?;
 
         if let Ok(cfg) = self.mihomo.get_base_config().await {
-            let tun_enable = cfg
-                .get("tun")
-                .and_then(|v| v.get("enable"))
-                .and_then(|v| v.as_bool());
+            let tun_enable = cfg.get("tun").and_then(|v| v.get("enable")).and_then(|v| v.as_bool());
             let tun_stack = cfg
                 .get("tun")
                 .and_then(|v| v.get("stack"))
@@ -1692,7 +1877,13 @@ impl App {
             ));
 
             if enabled && tun_enable != Some(true) {
-                let core_log = self.store.paths.root.join("core-home").join("logs").join("managed-core.log");
+                let core_log = self
+                    .store
+                    .paths
+                    .root
+                    .join("core-home")
+                    .join("logs")
+                    .join("managed-core.log");
                 let tails = tail_text_lines(&core_log, 16);
                 for line in &tails {
                     self.push_log(format!("core-log> {line}"));
@@ -1738,6 +1929,25 @@ impl App {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        if self.show_exit_confirm_overlay {
+            match key.code {
+                KeyCode::Esc => {
+                    self.show_exit_confirm_overlay = false;
+                }
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    self.exit_confirm_choice = ExitConfirmChoice::KeepBackend;
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    self.exit_confirm_choice = ExitConfirmChoice::StopBackend;
+                }
+                KeyCode::Enter => {
+                    self.confirm_quit_by_choice().await;
+                }
+                _ => {}
+            }
             return Ok(());
         }
 
@@ -1821,10 +2031,7 @@ impl App {
                         return Ok(());
                     }
                     KeyCode::Char('T') => {
-                        self.start_bulk_delay_test(
-                            self.store.state.verge.default_delay_test_url.clone(),
-                            5_000,
-                        );
+                        self.start_bulk_delay_test(self.store.state.verge.default_delay_test_url.clone(), 5_000);
                         return Ok(());
                     }
                     _ => {}
@@ -1832,10 +2039,9 @@ impl App {
             }
         }
 
-        let lock_tab_switch = matches!(self.current_tab(), Tab::Proxies)
-            && self.proxy_focus == ProxyFocus::Candidates;
+        let lock_tab_switch = matches!(self.current_tab(), Tab::Proxies) && self.proxy_focus == ProxyFocus::Candidates;
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char(':') => {
                 self.command_mode = true;
                 self.command_input.clear();
@@ -1940,6 +2146,19 @@ impl App {
                     self.store.state.verge.mixed_port,
                     self.store.state.verge.enable_system_proxy
                 ));
+                self.push_log(format!(
+                    "doctor: cleanup-on-exit={} backend-exit-policy={} (effective keep={}) {}",
+                    self.store.state.verge.auto_cleanup_on_exit,
+                    backend_exit_policy_label(self.store.state.verge.backend_exit_policy),
+                    self.effective_keep_core_on_exit(),
+                    self.auto_update_status_line()
+                ));
+                if let Some(pid) = self.read_managed_core_pid() {
+                    self.push_log(format!(
+                        "doctor: managed-core pid={pid}, alive={}",
+                        is_pid_alive(pid)
+                    ));
+                }
                 if let Ok(cfg) = self.mihomo.get_base_config().await {
                     let core_mixed = cfg
                         .get("mixed-port")
@@ -2061,6 +2280,34 @@ impl App {
                     let _ = self.refresh_profile_subscription_by_uid(target).await;
                 }
             }
+            "autosub" => match parts.next() {
+                Some("now") => {
+                    self.push_log("autosub: manual trigger");
+                    self.refresh_all_profile_subscriptions().await;
+                    self.schedule_next_auto_update("manual");
+                }
+                Some("status") | None => {
+                    self.push_log(self.auto_update_status_line());
+                }
+                Some("off") | Some("disable") | Some("0") => {
+                    self.store.state.verge.auto_update_subscription_minutes = 0;
+                    self.store.save().await?;
+                    self.schedule_next_auto_update("user");
+                }
+                Some(v) => {
+                    let Ok(minutes) = v.parse::<u64>() else {
+                        self.push_log("usage: autosub [off|status|now|<minutes>]");
+                        return Ok(());
+                    };
+                    if minutes == 0 {
+                        self.store.state.verge.auto_update_subscription_minutes = 0;
+                    } else {
+                        self.store.state.verge.auto_update_subscription_minutes = minutes;
+                    }
+                    self.store.save().await?;
+                    self.schedule_next_auto_update("user");
+                }
+            },
             "switch" => {
                 let Some(group) = parts.next() else {
                     self.push_log("usage: switch <group> <proxy>");
@@ -2141,6 +2388,76 @@ impl App {
                     Err(err) => self.push_log(format!("change mode failed: {err}")),
                 }
             }
+            "cleanup" => {
+                self.cleanup_before_exit().await;
+            }
+            "backend" => match parts.next() {
+                Some("status") | None => {
+                    self.push_log(format!("backend endpoint: {}", self.mihomo.endpoint_label()));
+                    self.push_log(format!(
+                        "backend-exit-policy={} (effective keep={})",
+                        backend_exit_policy_label(self.store.state.verge.backend_exit_policy),
+                        self.effective_keep_core_on_exit()
+                    ));
+                    if let Some(pid) = self.read_managed_core_pid() {
+                        self.push_log(format!("managed core pid={pid}, alive={}", is_pid_alive(pid)));
+                    } else {
+                        self.push_log("managed core pid file: not found");
+                    }
+                }
+                Some("start") => {
+                    let _ = self.ensure_mihomo_ready(true).await;
+                    self.refresh_proxies().await;
+                }
+                Some("stop") => {
+                    self.cleanup_before_exit().await;
+                    self.stop_managed_core_backend().await;
+                }
+                Some("keep") => {
+                    let Some(v) = parts.next() else {
+                        self.push_log("usage: backend keep <on|off>");
+                        return Ok(());
+                    };
+                    let Some(keep) = parse_on_off(v) else {
+                        self.push_log("usage: backend keep <on|off>");
+                        return Ok(());
+                    };
+                    self.store.state.verge.keep_core_on_exit = keep;
+                    self.store.state.verge.backend_exit_policy = if keep {
+                        BackendExitPolicy::AlwaysOn
+                    } else {
+                        BackendExitPolicy::AlwaysOff
+                    };
+                    self.store.save().await?;
+                    self.push_log(format!(
+                        "backend-exit-policy => {}",
+                        backend_exit_policy_label(self.store.state.verge.backend_exit_policy)
+                    ));
+                }
+                Some("policy") => {
+                    let Some(v) = parts.next() else {
+                        self.push_log("usage: backend policy <always-on|always-off|query>");
+                        return Ok(());
+                    };
+                    let Some(policy) = parse_backend_exit_policy(v) else {
+                        self.push_log("usage: backend policy <always-on|always-off|query>");
+                        return Ok(());
+                    };
+                    self.store.state.verge.backend_exit_policy = policy;
+                    if policy != BackendExitPolicy::Query {
+                        self.store.state.verge.keep_core_on_exit =
+                            matches!(policy, BackendExitPolicy::AlwaysOn);
+                    }
+                    self.store.save().await?;
+                    self.push_log(format!(
+                        "backend-exit-policy => {}",
+                        backend_exit_policy_label(policy)
+                    ));
+                }
+                _ => {
+                    self.push_log("usage: backend [status|start|stop|keep <on|off>|policy <always-on|always-off|query>]")
+                }
+            },
             "toggle" => {
                 match parts.next() {
                     Some("sysproxy") => {
@@ -2234,7 +2551,79 @@ impl App {
                             }
                         }
                     }
-                    _ => self.push_log("usage: set controller <url> | set secret <secret> | set mixed-port <port> | set proxy-host <host>"),
+                    Some("cleanup-on-exit") => {
+                        let Some(v) = parts.next() else {
+                            self.push_log("usage: set cleanup-on-exit <on|off>");
+                            return Ok(());
+                        };
+                        let Some(enabled) = parse_on_off(v) else {
+                            self.push_log("usage: set cleanup-on-exit <on|off>");
+                            return Ok(());
+                        };
+                        self.store.state.verge.auto_cleanup_on_exit = enabled;
+                        self.store.save().await?;
+                        self.push_log(format!("cleanup-on-exit => {enabled}"));
+                    }
+                    Some("keep-core-on-exit") => {
+                        let Some(v) = parts.next() else {
+                            self.push_log("usage: set keep-core-on-exit <on|off>");
+                            return Ok(());
+                        };
+                        let Some(enabled) = parse_on_off(v) else {
+                            self.push_log("usage: set keep-core-on-exit <on|off>");
+                            return Ok(());
+                        };
+                        self.store.state.verge.keep_core_on_exit = enabled;
+                        self.store.state.verge.backend_exit_policy = if enabled {
+                            BackendExitPolicy::AlwaysOn
+                        } else {
+                            BackendExitPolicy::AlwaysOff
+                        };
+                        self.store.save().await?;
+                        self.push_log(format!(
+                            "backend-exit-policy => {}",
+                            backend_exit_policy_label(self.store.state.verge.backend_exit_policy)
+                        ));
+                    }
+                    Some("backend-exit-policy") => {
+                        let Some(v) = parts.next() else {
+                            self.push_log("usage: set backend-exit-policy <always-on|always-off|query>");
+                            return Ok(());
+                        };
+                        let Some(policy) = parse_backend_exit_policy(v) else {
+                            self.push_log("usage: set backend-exit-policy <always-on|always-off|query>");
+                            return Ok(());
+                        };
+                        self.store.state.verge.backend_exit_policy = policy;
+                        if policy != BackendExitPolicy::Query {
+                            self.store.state.verge.keep_core_on_exit =
+                                matches!(policy, BackendExitPolicy::AlwaysOn);
+                        }
+                        self.store.save().await?;
+                        self.push_log(format!(
+                            "backend-exit-policy => {}",
+                            backend_exit_policy_label(policy)
+                        ));
+                    }
+                    Some("auto-update") => {
+                        let Some(v) = parts.next() else {
+                            self.push_log("usage: set auto-update <off|minutes>");
+                            return Ok(());
+                        };
+                        if v.eq_ignore_ascii_case("off") || v == "0" {
+                            self.store.state.verge.auto_update_subscription_minutes = 0;
+                        } else if let Ok(minutes) = v.parse::<u64>() {
+                            self.store.state.verge.auto_update_subscription_minutes = minutes;
+                        } else {
+                            self.push_log("usage: set auto-update <off|minutes>");
+                            return Ok(());
+                        }
+                        self.store.save().await?;
+                        self.schedule_next_auto_update("set");
+                    }
+                    _ => self.push_log(
+                        "usage: set controller <url> | set secret <secret> | set mixed-port <port> | set proxy-host <host> | set cleanup-on-exit <on|off> | set keep-core-on-exit <on|off> | set backend-exit-policy <always-on|always-off|query> | set auto-update <off|minutes>",
+                    ),
                 }
             }
             "use" => {
@@ -2260,7 +2649,7 @@ impl App {
                 self.store.save().await?;
                 self.push_log("state saved");
             }
-            "quit" | "exit" => self.should_quit = true,
+            "quit" | "exit" => self.request_quit(),
             other => self.push_log(format!("unknown command: {other}")),
         }
 
@@ -2434,7 +2823,13 @@ fn local_socket_candidates(hint: &ClashVergeApiHint) -> Vec<String> {
     out.push("/tmp/verge/verge-mihomo.sock".to_string());
     out.push("/var/tmp/verge/verge-mihomo.sock".to_string());
     if let Some(parent) = hint.source_config.parent() {
-        out.push(parent.join("verge").join("verge-mihomo.sock").to_string_lossy().to_string());
+        out.push(
+            parent
+                .join("verge")
+                .join("verge-mihomo.sock")
+                .to_string_lossy()
+                .to_string(),
+        );
     }
     out.sort();
     out.dedup();
@@ -2524,8 +2919,7 @@ fn tun_privilege_hint() -> String {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        "tun permission hint: run TUI with elevated privileges or use privileged service mode"
-            .to_string()
+        "tun permission hint: run TUI with elevated privileges or use privileged service mode".to_string()
     }
 }
 
@@ -2579,7 +2973,10 @@ fn ensure_tun_defaults_in_mapping(map: &mut serde_yaml_ng::Mapping, enable: bool
         tun.insert("auto-detect-interface".into(), true.into());
     }
     if !tun.contains_key("dns-hijack") {
-        tun.insert("dns-hijack".into(), serde_yaml_ng::Value::Sequence(vec!["any:53".into()]));
+        tun.insert(
+            "dns-hijack".into(),
+            serde_yaml_ng::Value::Sequence(vec!["any:53".into()]),
+        );
     }
     map.insert(tun_key, tun.into());
 }
@@ -2626,12 +3023,96 @@ fn run_command_probe(cmd: &str, args: &[&str]) -> (bool, String) {
             } else {
                 "no output".to_string()
             };
-            (
-                ok,
-                format!("{cmd} {:?} => ok={ok}, code={code}, msg={text}", args),
-            )
+            (ok, format!("{cmd} {:?} => ok={ok}, code={code}, msg={text}", args))
         }
         Err(err) => (false, format!("{cmd} {:?} => spawn failed: {err}", args)),
+    }
+}
+
+fn parse_on_off(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Some(true),
+        "off" | "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_backend_exit_policy(value: &str) -> Option<BackendExitPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "always-on" | "always_on" | "on" => Some(BackendExitPolicy::AlwaysOn),
+        "always-off" | "always_off" | "off" => Some(BackendExitPolicy::AlwaysOff),
+        "query" | "ask" => Some(BackendExitPolicy::Query),
+        _ => None,
+    }
+}
+
+fn backend_exit_policy_label(policy: BackendExitPolicy) -> &'static str {
+    match policy {
+        BackendExitPolicy::AlwaysOn => "always-on",
+        BackendExitPolicy::AlwaysOff => "always-off",
+        BackendExitPolicy::Query => "query",
+    }
+}
+
+fn terminate_pid(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        if !is_pid_alive(pid) {
+            return true;
+        }
+
+        let term = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()
+            .is_some_and(|s| s.success());
+
+        if !term {
+            return false;
+        }
+
+        for _ in 0..20 {
+            if !is_pid_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+
+        std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()
+            .is_some_and(|s| s.success())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -2763,6 +3244,9 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, _app: &App) {
         Line::from(""),
         Line::from("Commands:"),
         Line::from("help | doctor | logpath | health | adopt"),
+        Line::from("autosub [off|status|now|<minutes>]"),
+        Line::from("backend [status|start|stop|keep <on|off>|policy <always-on|always-off|query>]"),
+        Line::from("cleanup"),
         Line::from("sysproxy [on|off|toggle]"),
         Line::from("import <url>"),
         Line::from("reload proxies|subscriptions"),
@@ -2773,6 +3257,9 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, _app: &App) {
         Line::from("toggle sysproxy|tun"),
         Line::from("set controller <url> | set secret <secret>"),
         Line::from("set mixed-port <port> | set proxy-host <host>"),
+        Line::from("set cleanup-on-exit <on|off> | set keep-core-on-exit <on|off>"),
+        Line::from("set backend-exit-policy <always-on|always-off|query>"),
+        Line::from("set auto-update <off|minutes>"),
         Line::from("use <profile_uid> | save | quit"),
         Line::from(""),
         Line::from("Env: VERGE_TUI_USE_SERVICE_IPC=1 enables service IPC path"),
@@ -2781,6 +3268,54 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, _app: &App) {
 
     let panel = Paragraph::new(lines)
         .block(panel("Help", COLOR_ACCENT).style(Style::default().bg(COLOR_BG)))
+        .style(Style::default().fg(COLOR_TEXT))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, popup);
+}
+
+fn draw_exit_confirm_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let popup = centered_rect(frame.area(), 68, 38);
+    frame.render_widget(Clear, popup);
+
+    let keep_selected = matches!(app.exit_confirm_choice, ExitConfirmChoice::KeepBackend);
+    let keep_line = if keep_selected {
+        Line::from("[*] Keep Backend Running").style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::from("[ ] Keep Backend Running").style(Style::default().fg(COLOR_TEXT))
+    };
+    let stop_line = if keep_selected {
+        Line::from("[ ] Stop Backend And Cleanup").style(Style::default().fg(COLOR_TEXT))
+    } else {
+        Line::from("[*] Stop Backend And Cleanup").style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(COLOR_WARN)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let lines = vec![
+        Line::from("Exit verge-tui").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(format!(
+            "Current policy: {}",
+            backend_exit_policy_label(app.store.state.verge.backend_exit_policy)
+        )),
+        Line::from("Choose what to do with backend when leaving UI:"),
+        Line::from(""),
+        keep_line,
+        stop_line,
+        Line::from(""),
+        Line::from("Enter: confirm | Esc: cancel | ←/→ or h/l/j/k: switch"),
+    ];
+
+    let panel = Paragraph::new(lines)
+        .block(panel("Exit Confirm", COLOR_HOT).style(Style::default().bg(COLOR_BG)))
         .style(Style::default().fg(COLOR_TEXT))
         .wrap(Wrap { trim: false });
     frame.render_widget(panel, popup);
@@ -2800,12 +3335,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
-    let current_profile = app
-        .store
-        .state
-        .current
-        .as_deref()
-        .unwrap_or("-");
+    let current_profile = app.store.state.current.as_deref().unwrap_or("-");
     let status_line = Line::from(format!(
         " VERGE-TUI  uptime {}  ticks {}  profile {}  ",
         app.uptime_hms(),
@@ -2874,9 +3404,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .rev()
         .map(|log| ListItem::new(log.clone()))
         .collect::<Vec<_>>();
-    let log_widget = List::new(log_items).block(
-        panel("Event Feed", COLOR_WARN).style(Style::default().bg(COLOR_BG).fg(COLOR_TEXT)),
-    );
+    let log_widget =
+        List::new(log_items).block(panel("Event Feed", COLOR_WARN).style(Style::default().bg(COLOR_BG).fg(COLOR_TEXT)));
     frame.render_widget(log_widget, bottom_chunks[0]);
 
     let hints = match app.current_tab() {
@@ -2904,15 +3433,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let cmd = Paragraph::new(cmd_text)
         .block(
-            panel(
-                "Command",
-                if app.command_mode {
-                    Color::Magenta
-                } else {
-                    COLOR_PANEL
-                },
-            )
-            .style(Style::default().bg(COLOR_BG)),
+            panel("Command", if app.command_mode { Color::Magenta } else { COLOR_PANEL })
+                .style(Style::default().bg(COLOR_BG)),
         )
         .style(Style::default().fg(COLOR_TEXT))
         .wrap(Wrap { trim: true });
@@ -2920,6 +3442,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     if app.show_help_overlay {
         draw_help_overlay(frame, app);
+    }
+    if app.show_exit_confirm_overlay {
+        draw_exit_confirm_overlay(frame, app);
     }
 }
 
@@ -2945,10 +3470,7 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, ap
 
     let left_lines = vec![
         Line::from(format!("Current Profile : {}", current_profile_name)),
-        Line::from(format!(
-            "Profiles Count  : {}",
-            app.store.state.profiles.len()
-        )),
+        Line::from(format!("Profiles Count  : {}", app.store.state.profiles.len())),
         Line::from(format!("Proxy Groups    : {}", app.proxy_groups.len())),
         Line::from(format!(
             "Proxy Endpoint  : {}:{}",
@@ -2970,28 +3492,34 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, ap
                 "DISABLED"
             }
         )),
+        Line::from(format!(
+            "Auto Update     : {}",
+            if app.store.state.verge.auto_update_subscription_minutes == 0 {
+                "DISABLED".to_string()
+            } else {
+                format!("{} min", app.store.state.verge.auto_update_subscription_minutes)
+            }
+        )),
+        Line::from(format!(
+            "Exit Policy     : cleanup={} backend={} (effective keep={})",
+            app.store.state.verge.auto_cleanup_on_exit,
+            backend_exit_policy_label(app.store.state.verge.backend_exit_policy),
+            app.effective_keep_core_on_exit()
+        )),
     ];
-    let left_widget = Paragraph::new(left_lines).block(
-        panel("Core State", COLOR_ACCENT).style(Style::default().bg(COLOR_BG)),
-    );
+    let left_widget =
+        Paragraph::new(left_lines).block(panel("Core State", COLOR_ACCENT).style(Style::default().bg(COLOR_BG)));
     frame.render_widget(left_widget, top[0]);
 
     let up_max = app.traffic_up_history.iter().copied().max().unwrap_or(1);
     let down_max = app.traffic_down_history.iter().copied().max().unwrap_or(1);
     let traffic_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(4),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(4)])
         .split(top[1]);
 
     let up_gauge = Gauge::default()
-        .block(panel(
-            format!("Upload {}", format_bytes(app.traffic.up)),
-            COLOR_HOT,
-        ))
+        .block(panel(format!("Upload {}", format_bytes(app.traffic.up)), COLOR_HOT))
         .gauge_style(Style::default().fg(COLOR_HOT).bg(COLOR_BG))
         .ratio(calc_ratio(app.traffic.up, up_max));
     frame.render_widget(up_gauge, traffic_chunks[0]);
@@ -3044,9 +3572,8 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, ap
             ListItem::new(format!("{current} {}", profile.name))
         })
         .collect::<Vec<_>>();
-    let profiles_widget = List::new(profile_items).block(
-        panel("Profiles Snapshot", COLOR_PANEL).style(Style::default().bg(COLOR_BG)),
-    );
+    let profiles_widget =
+        List::new(profile_items).block(panel("Profiles Snapshot", COLOR_PANEL).style(Style::default().bg(COLOR_BG)));
     frame.render_widget(profiles_widget, bottom[0]);
 
     let network_lines = vec![
@@ -3061,9 +3588,8 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, ap
         Line::from(format!("Tick Rate      : 200ms")),
         Line::from(format!("Rendered Ticks : {}", app.tick_count)),
     ];
-    let net_widget = Paragraph::new(network_lines).block(
-        panel("Session Stats", COLOR_PANEL).style(Style::default().bg(COLOR_BG)),
-    );
+    let net_widget =
+        Paragraph::new(network_lines).block(panel("Session Stats", COLOR_PANEL).style(Style::default().bg(COLOR_BG)));
     frame.render_widget(net_widget, bottom[1]);
 }
 
@@ -3120,15 +3646,11 @@ fn draw_profiles(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, ap
                 extra
                     .map(|e| format_bytes(e.upload + e.download))
                     .unwrap_or_else(|| "-".to_string()),
-                extra
-                    .map(|e| format_bytes(e.total))
-                    .unwrap_or_else(|| "-".to_string())
+                extra.map(|e| format_bytes(e.total)).unwrap_or_else(|| "-".to_string())
             )),
             Line::from(format!(
                 "Expire     : {}",
-                extra
-                    .map(|e| e.expire.to_string())
-                    .unwrap_or_else(|| "-".to_string())
+                extra.map(|e| e.expire.to_string()).unwrap_or_else(|| "-".to_string())
             )),
         ]
     } else {
@@ -3184,9 +3706,7 @@ fn draw_proxies(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app
                 .get(candidate)
                 .map(|d| format!("{d:>4}ms"))
                 .unwrap_or_else(|| "   - ".to_string());
-            let item = ListItem::new(format!(
-                "{active_marker} {candidate:<36} {delay}"
-            ));
+            let item = ListItem::new(format!("{active_marker} {candidate:<36} {delay}"));
             candidate_items.push(item);
         }
     } else {
@@ -3198,10 +3718,7 @@ fn draw_proxies(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app
         "Candidates (select group then Enter)"
     };
     let candidates = List::new(candidate_items)
-        .block(
-            panel(candidates_title, COLOR_WARN)
-                .style(Style::default().bg(COLOR_BG)),
-        )
+        .block(panel(candidates_title, COLOR_WARN).style(Style::default().bg(COLOR_BG)))
         .highlight_style(if app.proxy_focus == ProxyFocus::Candidates {
             Style::default().fg(Color::Black).bg(COLOR_WARN)
         } else {
@@ -3230,15 +3747,9 @@ fn draw_proxies(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app
             .map(|d| format!("{d} ms"))
             .unwrap_or_else(|| "-".to_string());
         let bulk_status = if app.bulk_delay_running {
-            format!(
-                "RUNNING {}/{}",
-                app.bulk_delay_done, app.bulk_delay_total
-            )
+            format!("RUNNING {}/{}", app.bulk_delay_done, app.bulk_delay_total)
         } else if app.bulk_delay_total > 0 {
-            format!(
-                "DONE {}/{}",
-                app.bulk_delay_success, app.bulk_delay_total
-            )
+            format!("DONE {}/{}", app.bulk_delay_success, app.bulk_delay_total)
         } else {
             "IDLE".to_string()
         };
@@ -3257,9 +3768,8 @@ fn draw_proxies(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app
     } else {
         vec![Line::from("No proxy group selected")]
     };
-    let details = Paragraph::new(detail_lines).block(
-        panel("Selection Detail", COLOR_PANEL).style(Style::default().bg(COLOR_BG)),
-    );
+    let details =
+        Paragraph::new(detail_lines).block(panel("Selection Detail", COLOR_PANEL).style(Style::default().bg(COLOR_BG)));
     frame.render_widget(details, left_chunks[1]);
 }
 
@@ -3276,8 +3786,7 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &
         .map(|log| {
             let style = if log.contains("failed") || log.contains("error") {
                 Style::default().fg(COLOR_HOT)
-            } else if log.contains("imported") || log.contains("switched") || log.contains("applied")
-            {
+            } else if log.contains("imported") || log.contains("switched") || log.contains("applied") {
                 Style::default().fg(COLOR_ACCENT)
             } else {
                 Style::default().fg(COLOR_TEXT)
@@ -3286,9 +3795,7 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &
         })
         .collect::<Vec<_>>();
 
-    let list = List::new(items).block(
-        panel("Logs", COLOR_WARN).style(Style::default().bg(COLOR_BG)),
-    );
+    let list = List::new(items).block(panel("Logs", COLOR_WARN).style(Style::default().bg(COLOR_BG)));
     frame.render_widget(list, chunks[0]);
 
     let panel = Paragraph::new(vec![
@@ -3345,8 +3852,7 @@ async fn main() -> Result<()> {
     app.shutdown().await;
 
     disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).context("failed to leave alternate screen")?;
     terminal.show_cursor().context("failed to show cursor")?;
 
     Ok(())

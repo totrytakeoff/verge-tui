@@ -25,6 +25,8 @@
   - 刷新全部订阅
 - `update [selected|all|<profile_uid>]`
   - 更新订阅（当前/全部/指定）
+- `autosub [off|status|now|<minutes>]`
+  - 定时订阅更新配置（关闭/查看状态/立即执行/设置分钟间隔）
 - `use <profile_uid>`
   - 切换当前 profile
 
@@ -53,6 +55,13 @@
   - 切换 TUN
 - `sysproxy [on|off|toggle]`
   - 系统代理别名命令
+- `cleanup`
+  - 立即执行退出清理逻辑（关闭 TUN、关闭系统代理，尽可能恢复网络环境）
+- `backend [status|start|stop|keep <on|off>]`
+  - 后端控制（查看状态/拉起/停止/设置退出策略）
+  - `backend stop` 会自动执行清理逻辑
+  - `backend keep on/off` 是快捷方式，等价于 `always-on/always-off`
+  - `backend policy <always-on|always-off|query>` 可设置三态策略
 
 ## 参数设置
 
@@ -60,6 +69,10 @@
 - `set secret <secret>`
 - `set mixed-port <port>`
 - `set proxy-host <host>`
+- `set auto-update <off|minutes>`
+- `set cleanup-on-exit <on|off>`
+- `set keep-core-on-exit <on|off>`
+- `set backend-exit-policy <always-on|always-off|query>`
 
 ## 持久化与退出
 

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use reqwest::{Proxy, header::{CONTENT_DISPOSITION, HeaderMap, USER_AGENT}};
+use reqwest::{
+    Proxy,
+    header::{CONTENT_DISPOSITION, HeaderMap, USER_AGENT},
+};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
 
@@ -129,12 +132,10 @@ fn parse_subscription_userinfo(headers: &HeaderMap) -> Option<ProfileExtra> {
 }
 
 fn parse_kv_u64(input: &str, key: &str) -> Option<u64> {
-    input
-        .split(';')
-        .find_map(|part| {
-            let mut kv = part.splitn(2, '=');
-            let k = kv.next()?.trim();
-            let v = kv.next()?.trim();
-            if k == key { v.parse::<u64>().ok() } else { None }
-        })
+    input.split(';').find_map(|part| {
+        let mut kv = part.splitn(2, '=');
+        let k = kv.next()?.trim();
+        let v = kv.next()?.trim();
+        if k == key { v.parse::<u64>().ok() } else { None }
+    })
 }

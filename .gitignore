@@ -13,5 +13,9 @@ scripts/_env.sh
 .eslintcache
 .changelog_backups
 target
+install/*
+!install/README.md
+!install/install.sh
+!install/uninstall.sh
 CLAUDE.md
 .vfox.toml

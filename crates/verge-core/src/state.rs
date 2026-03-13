@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -6,7 +9,22 @@ use tokio::fs;
 
 use crate::subscription::{ImportOptions, import_subscription};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendExitPolicy {
+    AlwaysOn,
+    AlwaysOff,
+    Query,
+}
+
+impl Default for BackendExitPolicy {
+    fn default() -> Self {
+        Self::Query
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VergeConfig {
     pub enable_system_proxy: bool,
     pub enable_tun_mode: bool,
@@ -16,6 +34,10 @@ pub struct VergeConfig {
     pub secret: String,
     pub mixed_port: u16,
     pub default_delay_test_url: String,
+    pub auto_update_subscription_minutes: u64,
+    pub auto_cleanup_on_exit: bool,
+    pub keep_core_on_exit: bool,
+    pub backend_exit_policy: BackendExitPolicy,
 }
 
 impl Default for VergeConfig {
@@ -29,6 +51,10 @@ impl Default for VergeConfig {
             secret: String::new(),
             mixed_port: 7897,
             default_delay_test_url: "http://cp.cloudflare.com".to_string(),
+            auto_update_subscription_minutes: 0,
+            auto_cleanup_on_exit: true,
+            keep_core_on_exit: true,
+            backend_exit_policy: BackendExitPolicy::Query,
         }
     }
 }
@@ -52,6 +78,7 @@ pub struct ProfileItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AppState {
     pub verge: VergeConfig,
     pub current: Option<String>,

@@ -11,12 +11,16 @@
 ## 功能概览
 
 - 订阅导入与更新（多策略重试）
+- 定时自动更新订阅（可配置间隔）
 - 节点组/节点切换
 - 节点延迟测试（单节点/批量）
 - 实时流量与连接信息
 - 系统代理开关
 - TUN 模式开关与状态检查
 - 日志落盘与会话日志
+- 退出清理（恢复系统代理与网络路由环境）
+- 前后端弱耦合（UI 退出可保留后端 core）
+- 退出三态策略（`always-on` / `always-off` / `query`）
 
 ## 当前运行模式
 
@@ -40,6 +44,19 @@ cargo build -p verge-tui --release
 ./target/release/verge-tui
 ```
 
+### 4. 生成安装目录并安装到系统
+
+```bash
+./scripts/build-install.sh
+./install/install.sh
+```
+
+安装到当前用户目录：
+
+```bash
+./install/install.sh --user
+```
+
 ### 2. 运行
 
 ```bash
@@ -53,10 +70,14 @@ cargo build -p verge-tui --release
 - `import <url>`
 - `reload proxies`
 - `reload subscriptions`
+- `autosub status`
+- `autosub 60`
 - `toggle sysproxy|tun`
 - `sysproxy on|off|toggle`
 - `delay selected`
 - `delay all`
+- `backend status`
+- `cleanup`
 - `save`
 
 ## 文档
@@ -66,6 +87,21 @@ cargo build -p verge-tui --release
 - 开发文档：[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
 - 命令手册：[`docs/COMMANDS.md`](docs/COMMANDS.md)
 - 发布流程：[`docs/RELEASE.md`](docs/RELEASE.md)
+- 打包与 AUR：[`docs/PACKAGING.md`](docs/PACKAGING.md)
+
+## AUR 一键流程
+
+日常本地测试打包：
+
+```bash
+./scripts/aur-package.sh
+```
+
+发布到 AUR（自动更新校验和、刷新 `.SRCINFO`、提交并推送）：
+
+```bash
+./scripts/aur-push.sh
+```
 
 ## 协议与来源
 

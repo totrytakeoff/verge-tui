@@ -13,6 +13,14 @@
 - UI 命令 -> `verge-tui` 调度 -> `mihomo-client` 调用 API
 - 配置/订阅 -> `verge-core::StateStore` 落盘并维护
 
+## 前后端拆分策略
+
+- `mihomo core` 作为后端数据面与控制面执行体
+- `verge-tui` 作为前端控制台，仅负责状态展示与指令下发
+- 默认退出策略 `backend-exit-policy=query`：退出时弹窗选择是否保留后端
+- 支持 `always-on/always-off/query` 三态退出策略
+- 通过 `backend stop` 可显式停止由 TUI 拉起的后端
+
 ## 运行模式
 
 ### Direct Core First（默认）
@@ -34,6 +42,7 @@
 - 状态文件：`state.yaml`
 - 订阅文件：`profiles/*.yaml`
 - 运行时配置：`core-home/verge-tui-runtime.yaml`
+- 后端 PID（TUI 启动）：`core-home/managed-core.pid`
 - 日志：`logs/verge-tui.log` 与 `logs/session-*.log`
 
 ## 安全与权限

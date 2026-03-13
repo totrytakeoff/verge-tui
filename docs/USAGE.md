@@ -10,7 +10,7 @@
 
 ## 键位
 
-- `q`：退出
+- `q`：退出（当退出策略为 `query` 时会弹出确认窗）
 - `Tab / Shift+Tab / h / l`：切换主标签
 - `j / k`：列表移动
 - `Enter`：确认操作
@@ -30,6 +30,9 @@
 - `import <url>`：导入订阅
 - `reload subscriptions`：更新全部订阅
 - `update selected`：更新当前订阅
+- `autosub status`：查看自动更新状态
+- `autosub 60`：每 60 分钟自动更新一次
+- `autosub off`：关闭自动更新
 - `use <profile_uid>`：切换 profile
 
 ### 节点与测速
@@ -47,6 +50,10 @@
 ### 持久化
 
 - `save`
+- `cleanup`：执行一次退出清理（关闭系统代理/TUN）
+- `backend status`：查看后端状态
+- `backend stop`：停止由 TUI 管理的后端 core（自动清理）
+- `backend policy query`：退出时弹窗选择是否保留后端
 
 ## 环境变量
 

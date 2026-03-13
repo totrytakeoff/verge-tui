@@ -10,12 +10,9 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    client_async, connect_async,
-    tungstenite::handshake::client::generate_key,
-};
 #[cfg(unix)]
 use tokio::{net::UnixStream, time::sleep};
+use tokio_tungstenite::{client_async, connect_async, tungstenite::handshake::client::generate_key};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -33,11 +30,8 @@ pub struct MihomoClient {
 
 impl MihomoClient {
     pub fn new(base_url: &str, secret: Option<&str>) -> Result<Self> {
-        let base_url = Url::parse(base_url)
-            .with_context(|| format!("invalid controller URL: {base_url}"))?;
-        let secret = secret
-            .filter(|s| !s.is_empty())
-            .map(std::string::ToString::to_string);
+        let base_url = Url::parse(base_url).with_context(|| format!("invalid controller URL: {base_url}"))?;
+        let secret = secret.filter(|s| !s.is_empty()).map(std::string::ToString::to_string);
         let http = build_http_client(secret.as_deref(), None)?;
         Ok(Self {
             endpoint: Endpoint::Http { base_url },
@@ -126,12 +120,7 @@ impl MihomoClient {
         Ok(())
     }
 
-    pub async fn delay_proxy_by_name(
-        &self,
-        proxy_name: &str,
-        url: &str,
-        timeout_ms: u64,
-    ) -> Result<ProxyDelayResp> {
+    pub async fn delay_proxy_by_name(&self, proxy_name: &str, url: &str, timeout_ms: u64) -> Result<ProxyDelayResp> {
         let proxy_name = urlencoding::encode(proxy_name);
         let test_url = urlencoding::encode(url);
         let path = format!("/proxies/{proxy_name}/delay?url={test_url}&timeout={timeout_ms}");
@@ -228,9 +217,7 @@ impl MihomoClient {
                 {
                     let _ = path;
                     let _ = socket_path;
-                    return Err(anyhow!(
-                        "local socket websocket is unsupported on this platform"
-                    ));
+                    return Err(anyhow!("local socket websocket is unsupported on this platform"));
                 }
             }
         }
@@ -347,9 +334,8 @@ async fn connect_unix_socket(socket_path: &str) -> Result<UnixStream> {
             Err(err) => {
                 retries += 1;
                 if retries >= 3 {
-                    return Err(err).with_context(|| {
-                        format!("failed to connect unix socket after retries: {socket_path}")
-                    });
+                    return Err(err)
+                        .with_context(|| format!("failed to connect unix socket after retries: {socket_path}"));
                 }
                 sleep(Duration::from_millis(80)).await;
             }
