@@ -1,6 +1,6 @@
-# 打包与 AUR 维护
+# 打包与仓库维护
 
-本文档说明 `verge-tui` 的本地打包、AUR 元数据生成与推送流程。
+本文档说明 `verge-tui` 的本地打包、AUR 元数据生成，以及 Debian/APT 发布流程。
 
 ## 相关脚本
 
@@ -87,3 +87,115 @@
 - AUR 不会自动从 GitHub 同步，必须手动提交 AUR 仓库。
 - `--release` 模式依赖 `PKGBUILD` 的 `source` 可访问且版本存在。
 - 首次推送前需配置好 AUR 账号 SSH key。
+
+## Debian / APT
+
+APT 不存在类似 AUR 的统一中央仓库提交流程。常见发布方式有两种：
+
+- 自托管 APT 仓库：把 `.deb` 和索引文件发布到 GitHub Pages、S3、自己的站点等
+- Launchpad PPA：适合 Ubuntu 系，但它是 PPA 体系，不是通用 Debian 仓库
+
+当前仓库已经提供自托管 APT 所需脚本。
+
+### `build-deb.sh`
+
+用途：从当前源码生成 `.deb` 包。
+
+```bash
+./scripts/build-deb.sh
+```
+
+常用参数：
+
+- `--out <dir>`：输出目录，默认 `./dist/deb`
+- `--arch <arch>`：覆盖 Debian 架构，例如 `amd64`、`arm64`
+- `--pkgrel <rel>`：Debian 包修订号，默认 `1`
+- `--no-core`：不把 `verge-mihomo` 一起打进包
+
+输出示例：
+
+- `dist/deb/verge-tui_0.1.1-1_amd64.deb`
+
+### `build-apt-repo.sh`
+
+用途：把 `dist/deb/*.deb` 组织成一个可静态托管的 APT 仓库目录。
+
+```bash
+./scripts/build-apt-repo.sh
+```
+
+常用参数：
+
+- `--deb-dir <dir>`：输入 `.deb` 目录，默认 `./dist/deb`
+- `--repo-dir <dir>`：输出仓库目录，默认 `./dist/apt`
+- `--origin <name>`：Release 的 `Origin`
+- `--label <name>`：Release 的 `Label`
+- `--suite <name>`：默认 `stable`
+- `--codename <name>`：默认 `stable`
+- `--component <name>`：默认 `main`
+- `--gpg-key <id>`：用指定 GPG key 生成 `Release.gpg` 和 `InRelease`
+
+输出目录示例：
+
+- `dist/apt/pool/main/v/verge-tui/*.deb`
+- `dist/apt/dists/stable/main/binary-amd64/Packages`
+- `dist/apt/dists/stable/Release`
+
+### GitHub Release 集成
+
+当前 `release.yml` 已在 Linux tag 构建中自动：
+
+- 生成 `.deb`
+- 生成 `dist/apt` 仓库目录 artifact
+- 把 `.deb` 上传到 GitHub Release
+
+### GitHub Pages 托管 APT 仓库
+
+仓库已提供：
+
+- [apt-pages.yml](/home/myself/workspace/ClashT/verge-tui/.github/workflows/apt-pages.yml)
+
+作用：
+
+- 在 `v*` tag push 时自动构建 `.deb`
+- 自动生成 `dist/apt`
+- 自动部署到 GitHub Pages 的 `/apt/` 路径
+
+启用前提：
+
+1. 在 GitHub 仓库设置里启用 `Pages`
+2. Source 选择 `GitHub Actions`
+
+启用后，APT 仓库地址通常会是：
+
+```text
+https://<your-user>.github.io/<repo>/apt
+```
+
+### 建议发布路线
+
+1. 本地验证：`cargo check -p verge-tui`
+2. 打 tag：例如 `v0.1.1`
+3. GitHub Actions 自动生成二进制和 `.deb`
+4. 选择一种仓库发布方式：
+
+- 简单分发：直接让 Debian/Ubuntu 用户从 GitHub Release 下载 `.deb`
+- APT 仓库：把 `dist/apt` 发布到 GitHub Pages 或其他静态托管
+
+### 如果要给用户配置 APT 源
+
+假设你把 `dist/apt` 发布到了：
+
+```text
+https://totrytakeoff.github.io/verge-tui/apt
+```
+
+则用户可以配置：
+
+```bash
+echo "deb [trusted=yes] https://totrytakeoff.github.io/verge-tui/apt stable main" | sudo tee /etc/apt/sources.list.d/verge-tui.list
+sudo apt update
+sudo apt install verge-tui
+```
+
+如果你启用了 GPG 签名，就不该再使用 `trusted=yes`，而应该分发仓库公钥。

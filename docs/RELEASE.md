@@ -22,6 +22,15 @@
 ./scripts/aur-push.sh
 ```
 
+4. 如需 Debian/APT 分发，构建 `.deb` 与 APT 仓库目录：
+
+```bash
+./scripts/build-deb.sh
+./scripts/build-apt-repo.sh
+```
+
+5. 如需自动托管 APT 仓库，启用 GitHub Pages，并确保 `apt-pages.yml` 可运行。
+
 该脚本会自动执行：
 
 - `./scripts/aur-package.sh --release`
@@ -44,6 +53,8 @@
 ## 产物
 
 - Linux/macOS/Windows 二进制（按目标平台交叉编译）
+- Debian `.deb`
+- 静态 APT 仓库目录（`dist/apt`）
 
 ## 发布说明建议
 

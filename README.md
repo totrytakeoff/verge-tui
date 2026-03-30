@@ -103,6 +103,22 @@ cargo build -p verge-tui --release
 ./scripts/aur-push.sh
 ```
 
+## Debian / APT
+
+构建 `.deb`：
+
+```bash
+./scripts/build-deb.sh
+```
+
+构建静态 APT 仓库目录：
+
+```bash
+./scripts/build-apt-repo.sh
+```
+
+仓库已附带 GitHub Pages 发布工作流，可把 `dist/apt` 自动部署为可访问的 APT 源。
+
 ## 协议与来源
 
 - 许可证：`GPL-3.0-only`，见 [`LICENSE`](LICENSE)
