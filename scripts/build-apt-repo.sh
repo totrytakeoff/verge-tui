@@ -10,6 +10,7 @@ SUITE="stable"
 CODENAME="stable"
 COMPONENT="main"
 GPG_KEY=""
+PUBLIC_KEY_NAME="verge-tui-archive-keyring"
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,8 @@ Options:
   --codename <name>   Release Codename field (default: stable)
   --component <name>  Repository component (default: main)
   --gpg-key <id>      Sign Release/InRelease using this GPG key
+  --public-key-name <name>
+                      Base name for exported public key files
   -h, --help          Show this help
 EOF
 }
@@ -60,6 +63,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --gpg-key)
       GPG_KEY="${2:-}"
+      shift
+      ;;
+    --public-key-name)
+      PUBLIC_KEY_NAME="${2:-}"
       shift
       ;;
     -h|--help)
@@ -197,8 +204,17 @@ mkdir -p "$(dirname "${release_file}")"
 } > "${release_file}"
 
 if [[ -n "${GPG_KEY}" ]]; then
-  gpg --batch --yes --local-user "${GPG_KEY}" --armor --detach-sign --output "${release_file}.gpg" "${release_file}"
-  gpg --batch --yes --local-user "${GPG_KEY}" --clearsign --output "${REPO_DIR}/dists/${CODENAME}/InRelease" "${release_file}"
+  gpg_sign_args=(--batch --yes --local-user "${GPG_KEY}")
+  gpg_export_args=(--batch --yes)
+  if [[ -n "${GPG_PASSPHRASE:-}" ]]; then
+    gpg_sign_args+=(--pinentry-mode loopback --passphrase "${GPG_PASSPHRASE}")
+    gpg_export_args+=(--pinentry-mode loopback --passphrase "${GPG_PASSPHRASE}")
+  fi
+
+  gpg "${gpg_sign_args[@]}" --armor --detach-sign --output "${release_file}.gpg" "${release_file}"
+  gpg "${gpg_sign_args[@]}" --clearsign --output "${REPO_DIR}/dists/${CODENAME}/InRelease" "${release_file}"
+  gpg "${gpg_export_args[@]}" --armor --export "${GPG_KEY}" > "${REPO_DIR}/${PUBLIC_KEY_NAME}.asc"
+  gpg "${gpg_export_args[@]}" --export "${GPG_KEY}" | gpg --dearmor > "${REPO_DIR}/${PUBLIC_KEY_NAME}.gpg"
 fi
 
 echo "Built APT repository:"

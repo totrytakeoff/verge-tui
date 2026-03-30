@@ -118,6 +118,7 @@ cargo build -p verge-tui --release
 ```
 
 仓库已附带 GitHub Pages 发布工作流，可把 `dist/apt` 自动部署为可访问的 APT 源。
+如果配置了 GPG signing secrets，还会自动发布带签名的 `InRelease/Release.gpg` 和仓库公钥。
 
 ## 协议与来源
 

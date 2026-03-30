@@ -38,11 +38,29 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Import APT signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${APT_GPG_PRIVATE_KEY}" ]]; then
+            echo "No APT_GPG_PRIVATE_KEY secret configured; publishing unsigned APT repo."
+            exit 0
+          fi
+          printf '%s' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+
       - name: Build .deb and apt repo
+        env:
+          APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
           chmod +x scripts/build-deb.sh scripts/build-apt-repo.sh scripts/build-install.sh
           ./scripts/build-deb.sh
-          ./scripts/build-apt-repo.sh
+          if [[ -n "${APT_GPG_KEY_ID}" ]]; then
+            export GPG_PASSPHRASE="${APT_GPG_PASSPHRASE}"
+            ./scripts/build-apt-repo.sh --gpg-key "${APT_GPG_KEY_ID}"
+          else
+            ./scripts/build-apt-repo.sh
+          fi
 
       - name: Prepare Pages content
         run: |
