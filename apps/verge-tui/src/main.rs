@@ -108,6 +108,16 @@ enum BulkDelayEvent {
     Finished,
 }
 
+#[derive(Debug)]
+enum CommandEvent {
+    Log(String),
+    ImportFinished {
+        store: StateStore,
+        imported_count: usize,
+        last_imported: Option<(String, String, String)>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitConfirmChoice {
     KeepBackend,
@@ -145,6 +155,7 @@ struct App {
     traffic_rx: Option<mpsc::Receiver<TrafficResp>>,
     connections_rx: Option<mpsc::Receiver<ConnectionsResp>>,
     bulk_delay_rx: Option<mpsc::Receiver<BulkDelayEvent>>,
+    command_rx: Option<mpsc::Receiver<CommandEvent>>,
     bulk_delay_running: bool,
     bulk_delay_total: usize,
     bulk_delay_done: usize,
@@ -210,6 +221,7 @@ impl App {
             traffic_rx: None,
             connections_rx: None,
             bulk_delay_rx: None,
+            command_rx: None,
             bulk_delay_running: false,
             bulk_delay_total: 0,
             bulk_delay_done: 0,
@@ -1379,6 +1391,49 @@ impl App {
         }
 
         self.maybe_run_auto_update().await;
+
+        let mut import_finished = None;
+        let mut command_logs = Vec::new();
+        if let Some(rx) = &mut self.command_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    CommandEvent::Log(msg) => command_logs.push(msg),
+                    CommandEvent::ImportFinished {
+                        store,
+                        imported_count,
+                        last_imported,
+                    } => {
+                        import_finished = Some((store, imported_count, last_imported));
+                    }
+                }
+            }
+        }
+
+        for msg in command_logs {
+            self.push_log(msg);
+        }
+
+        if let Some((store, imported_count, last_imported)) = import_finished {
+            self.store = store;
+            if let Some((profile_uid, profile_name, mode)) = last_imported {
+                self.selected_profile_idx = self
+                    .store
+                    .state
+                    .profiles
+                    .iter()
+                    .position(|p| p.uid == profile_uid)
+                    .unwrap_or_else(|| self.store.state.profiles.len().saturating_sub(1));
+                self.sync_profile_cursor();
+                self.push_log(format!(
+                    "import completed: {imported_count} profile(s), current => {profile_name} ({profile_uid}) via {mode}"
+                ));
+                self.activate_selected_profile().await;
+            } else {
+                self.push_log("import failed after retries");
+            }
+            self.command_rx = None;
+        }
+
         if let Some(rx) = &mut self.traffic_rx {
             while let Ok(traffic) = rx.try_recv() {
                 self.traffic = traffic;
@@ -2082,6 +2137,197 @@ impl App {
         Ok(())
     }
 
+    async fn import_targets_at_startup(&mut self, specs: &[String]) -> Result<()> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+
+        let mut all_targets = Vec::new();
+        for spec in specs {
+            let targets = resolve_import_targets(spec)
+                .with_context(|| format!("resolve startup import source failed: {spec}"))?;
+            all_targets.extend(targets);
+        }
+
+        if all_targets.is_empty() {
+            self.push_log("startup import skipped: no usable subscription URL found");
+            return Ok(());
+        }
+
+        self.push_log(format!("startup import: {} target(s)", all_targets.len()));
+        let mut last_imported = None;
+
+        for url in all_targets {
+            self.push_log(format!("startup import source: {url}"));
+            if let Some((uid, name, mode)) = self.import_single_profile_with_retries(&url).await {
+                last_imported = Some((uid, name, mode));
+            } else {
+                self.push_log(format!("startup import failed for source: {url}"));
+            }
+        }
+
+        if let Some((uid, name, _mode)) = last_imported {
+            self.store.state.current = Some(uid.clone());
+            self.store.save().await?;
+            self.selected_profile_idx = self
+                .store
+                .state
+                .profiles
+                .iter()
+                .position(|p| p.uid == uid)
+                .unwrap_or_else(|| self.store.state.profiles.len().saturating_sub(1));
+            self.sync_profile_cursor();
+            self.push_log(format!("startup import selected current profile => {name} ({uid})"));
+        }
+
+        Ok(())
+    }
+
+    async fn import_single_profile_with_retries(&mut self, url: &str) -> Option<(String, String, String)> {
+        let attempts = [
+            (
+                "direct",
+                ImportOptions {
+                    timeout_seconds: 20,
+                    ..ImportOptions::default()
+                },
+            ),
+            (
+                "self_proxy",
+                ImportOptions {
+                    timeout_seconds: 20,
+                    self_proxy: true,
+                    ..ImportOptions::default()
+                },
+            ),
+            (
+                "system_proxy",
+                ImportOptions {
+                    timeout_seconds: 20,
+                    with_proxy: true,
+                    ..ImportOptions::default()
+                },
+            ),
+        ];
+
+        for (mode, options) in attempts {
+            self.push_log(format!("import attempt: {mode}"));
+            match self.store.import_profile(url, &options).await {
+                Ok(profile) => {
+                    self.push_log(format!(
+                        "imported profile: {} ({}) via {mode}",
+                        profile.name, profile.uid
+                    ));
+                    return Some((profile.uid, profile.name, mode.to_string()));
+                }
+                Err(err) => {
+                    self.push_log(format!("import ({mode}) failed: {err}"));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn handle_command_mode_paste(&mut self, text: &str) {
+        let sanitized = text.chars().filter(|c| *c != '\r' && *c != '\n').collect::<String>();
+        self.command_input.push_str(&sanitized);
+    }
+
+    fn start_import_command(&mut self, url: String) {
+        if self.command_rx.is_some() {
+            self.push_log("import is already running");
+            return;
+        }
+        let targets = match resolve_import_targets(&url) {
+            Ok(targets) => targets,
+            Err(err) => {
+                self.push_log(format!("resolve import target failed: {err}"));
+                return;
+            }
+        };
+        if targets.is_empty() {
+            self.push_log("import source did not contain any usable subscription URL");
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(32);
+        self.command_rx = Some(rx);
+        self.push_log(format!("import queued: {} target(s)", targets.len()));
+
+        let mut store = self.store.clone();
+        tokio::spawn(async move {
+            let mut imported_count = 0usize;
+            let mut last_imported = None;
+
+            for url in targets {
+                let _ = tx.send(CommandEvent::Log(format!("import source: {url}"))).await;
+                let attempts = [
+                    (
+                        "direct",
+                        ImportOptions {
+                            timeout_seconds: 20,
+                            ..ImportOptions::default()
+                        },
+                    ),
+                    (
+                        "self_proxy",
+                        ImportOptions {
+                            timeout_seconds: 20,
+                            self_proxy: true,
+                            ..ImportOptions::default()
+                        },
+                    ),
+                    (
+                        "system_proxy",
+                        ImportOptions {
+                            timeout_seconds: 20,
+                            with_proxy: true,
+                            ..ImportOptions::default()
+                        },
+                    ),
+                ];
+
+                let mut imported = false;
+                for (mode, options) in attempts {
+                    let _ = tx.send(CommandEvent::Log(format!("import attempt: {mode}"))).await;
+                    match store.import_profile(&url, &options).await {
+                        Ok(profile) => {
+                            imported_count = imported_count.saturating_add(1);
+                            let _ = tx
+                                .send(CommandEvent::Log(format!(
+                                    "imported profile: {} ({}) via {mode}",
+                                    profile.name, profile.uid
+                                )))
+                                .await;
+                            last_imported = Some((profile.uid, profile.name, mode.to_string()));
+                            imported = true;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx
+                                .send(CommandEvent::Log(format!("import ({mode}) failed: {err}")))
+                                .await;
+                        }
+                    }
+                }
+
+                if !imported {
+                    let _ = tx
+                        .send(CommandEvent::Log(format!("import failed for source: {url}")))
+                        .await;
+                }
+            }
+            let _ = tx
+                .send(CommandEvent::ImportFinished {
+                    store,
+                    imported_count,
+                    last_imported,
+                })
+                .await;
+        });
+    }
+
     async fn execute_command(&mut self, cmd: &str) -> Result<()> {
         let mut parts = cmd.split_whitespace();
         let Some(action) = parts.next() else {
@@ -2205,60 +2451,13 @@ impl App {
                 }
             }
             "import" => {
-                let Some(url) = parts.next() else {
+                let url = parts.collect::<Vec<_>>().join(" ");
+                let url = url.trim().to_string();
+                if url.is_empty() {
                     self.push_log("usage: import <url>");
                     return Ok(());
-                };
-
-                let attempts = [
-                    (
-                        "direct",
-                        ImportOptions {
-                            timeout_seconds: 20,
-                            ..ImportOptions::default()
-                        },
-                    ),
-                    (
-                        "self_proxy",
-                        ImportOptions {
-                            timeout_seconds: 20,
-                            self_proxy: true,
-                            ..ImportOptions::default()
-                        },
-                    ),
-                    (
-                        "system_proxy",
-                        ImportOptions {
-                            timeout_seconds: 20,
-                            with_proxy: true,
-                            ..ImportOptions::default()
-                        },
-                    ),
-                ];
-
-                let mut imported = false;
-                for (mode, options) in attempts {
-                    match self.store.import_profile(url, &options).await {
-                        Ok(profile) => {
-                            self.push_log(format!(
-                                "imported profile: {} ({}) via {mode}",
-                                profile.name, profile.uid
-                            ));
-                            self.selected_profile_idx = self.store.state.profiles.len().saturating_sub(1);
-                            self.sync_profile_cursor();
-                            self.activate_selected_profile().await;
-                            imported = true;
-                            break;
-                        }
-                        Err(err) => {
-                            self.push_log(format!("import ({mode}) failed: {err}"));
-                        }
-                    }
                 }
-
-                if !imported {
-                    self.push_log("import failed after retries");
-                }
+                self.start_import_command(url);
             }
             "reload" => {
                 let target = parts.next().unwrap_or_default();
@@ -3248,13 +3447,14 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, _app: &App) {
         Line::from("backend [status|start|stop|keep <on|off>|policy <always-on|always-off|query>]"),
         Line::from("cleanup"),
         Line::from("sysproxy [on|off|toggle]"),
-        Line::from("import <url>"),
+        Line::from("import <url|file.txt>"),
         Line::from("reload proxies|subscriptions"),
         Line::from("update [selected|all|<profile_uid>]"),
         Line::from("switch <group> <proxy>"),
         Line::from("delay <proxy|selected|all> [url] [timeout_ms]"),
         Line::from("mode <rule|global|direct>"),
         Line::from("toggle sysproxy|tun"),
+        Line::from("CLI: verge-tui --import <url|file.txt>"),
         Line::from("set controller <url> | set secret <secret>"),
         Line::from("set mixed-port <port> | set proxy-host <host>"),
         Line::from("set cleanup-on-exit <on|off> | set keep-core-on-exit <on|off>"),
@@ -3426,7 +3626,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(hint_widget, bottom_chunks[1]);
 
     let cmd_text = if app.command_mode {
-        format!(":{}", app.command_input)
+        format_command_input(app, chunks[3].width)
     } else {
         "Press ':' for commands".to_string()
     };
@@ -3811,9 +4011,95 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &
     frame.render_widget(panel, chunks[1]);
 }
 
+fn format_command_input(app: &App, width: u16) -> String {
+    let full = format!(":{}", app.command_input);
+    let max_visible = usize::from(width.saturating_sub(4)).max(1);
+    let char_count = full.chars().count();
+    if char_count <= max_visible {
+        return full;
+    }
+
+    let tail_len = max_visible.saturating_sub(1);
+    let tail = full
+        .chars()
+        .skip(char_count.saturating_sub(tail_len))
+        .collect::<String>();
+    format!("…{tail}")
+}
+
+fn parse_cli_import_specs() -> Result<Vec<String>> {
+    let mut args = std::env::args().skip(1);
+    let mut specs = Vec::new();
+
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--import=") {
+            if value.trim().is_empty() {
+                bail!("--import requires a non-empty value");
+            }
+            specs.push(value.to_string());
+            continue;
+        }
+
+        if arg == "--import" {
+            let Some(value) = args.next() else {
+                bail!("--import requires a value");
+            };
+            if value.trim().is_empty() {
+                bail!("--import requires a non-empty value");
+            }
+            specs.push(value);
+            continue;
+        }
+    }
+
+    Ok(specs)
+}
+
+fn resolve_import_targets(spec: &str) -> Result<Vec<String>> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if looks_like_remote_url(spec) {
+        return Ok(vec![spec.to_string()]);
+    }
+
+    let path = PathBuf::from(spec);
+    if !path.exists() {
+        bail!("import source is neither a URL nor an existing file: {spec}");
+    }
+    if !path.is_file() {
+        bail!("import source is not a file: {}", path.display());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read import file failed: {}", path.display()))?;
+    let targets = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| looks_like_remote_url(line))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if targets.is_empty() {
+        bail!("import file does not contain any valid http/https URL: {}", path.display());
+    }
+
+    Ok(targets)
+}
+
+fn looks_like_remote_url(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let startup_import_specs = parse_cli_import_specs()?;
     let mut app = App::new().await?;
+    app.import_targets_at_startup(&startup_import_specs).await?;
 
     enable_raw_mode().context("failed to enable raw mode")?;
 
@@ -3833,10 +4119,18 @@ async fn main() -> Result<()> {
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_millis(0));
 
-        if event::poll(timeout).context("event poll failed")?
-            && let Event::Key(key) = event::read().context("event read failed")?
-        {
-            app.handle_key(key).await?;
+        if event::poll(timeout).context("event poll failed")? {
+            match event::read().context("event read failed")? {
+                Event::Key(key) => {
+                    app.handle_key(key).await?;
+                }
+                Event::Paste(text) => {
+                    if app.command_mode {
+                        app.handle_command_mode_paste(&text);
+                    }
+                }
+                _ => {}
+            }
         }
 
         if last_tick.elapsed() >= tick_rate {

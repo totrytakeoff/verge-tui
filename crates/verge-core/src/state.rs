@@ -121,6 +121,7 @@ impl AppPaths {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct StateStore {
     pub paths: AppPaths,
     pub state: AppState,

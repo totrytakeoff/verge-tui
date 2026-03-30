@@ -1,5 +1,5 @@
 pkgname=verge-tui
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Standalone Rust TUI for Mihomo/Clash core management"
 arch=('x86_64' 'aarch64')

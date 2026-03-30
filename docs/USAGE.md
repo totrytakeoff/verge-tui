@@ -8,6 +8,15 @@
 
 启动后按 `:` 进入命令模式。
 
+启动时直接导入订阅：
+
+```bash
+./target/release/verge-tui --import "https://example.com/sub.yaml"
+./target/release/verge-tui --import /path/to/subscriptions.txt
+```
+
+如果传入的是文件，程序会读取其中每一行的 `http/https` 链接并逐条导入。
+
 ## 键位
 
 - `q`：退出（当退出策略为 `query` 时会弹出确认窗）
@@ -27,7 +36,7 @@
 
 ### 订阅与配置
 
-- `import <url>`：导入订阅
+- `import <url|file.txt>`：导入订阅，文件模式会按行读取 `http/https` 链接
 - `reload subscriptions`：更新全部订阅
 - `update selected`：更新当前订阅
 - `autosub status`：查看自动更新状态
